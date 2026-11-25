@@ -1,0 +1,6 @@
+connections*.csv
+*.pt
+.venv/
+__pycache__/
+.idea/
+clips/
