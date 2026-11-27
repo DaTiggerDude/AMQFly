@@ -5,13 +5,21 @@ synthetic graph. Everything else -- audio processing, training loop, saving,
 inference -- is reused directly from fly_amq_classifier.py so the two stay
 in sync and you don't have two copies of the same logic drifting apart.
 
-Usage:
-    python3 fly_amq_classifier_real.py train training clips connections_princeton.csv
+Class names are restored to the ORIGINAL anime titles (from manifest.json,
+written by the download script) instead of the sanitized folder names, so
+saved models and predictions show e.g. "Uchitama?! Have You Seen My Tama?"
+rather than "Uchitama_! Have You Seen My Tama_".
+
+Usage (quote the clips folder if it contains a space):
+    python3 fly_amq_classifier_real.py train "training clips" connections_princeton.csv
     python3 fly_amq_classifier_real.py predict path/to/snippet.mp3 [model.pt]
 
 Requires: torch, numpy, librosa, pandas
     pip install pandas --break-system-packages
 """
+
+import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -33,6 +41,25 @@ from fly_amq_classifier import (
 PRE_COL_CANDIDATES = ["pre_root_id", "pre_pt_root_id", "pre_id", "pre"]
 POST_COL_CANDIDATES = ["post_root_id", "post_pt_root_id", "post_id", "post"]
 WEIGHT_COL_CANDIDATES = ["syn_count", "weight", "n_synapses", "count", "cleft_scores"]
+
+
+def load_folder_to_original(clips_dir):
+    """
+    Reads manifest.json from the clips folder and returns a dict mapping the
+    (sanitized) folder name on disk -> the original animeENName from the JSON.
+    Returns an empty dict if there is no manifest, in which case folder names
+    are used as class names unchanged.
+    """
+    path = os.path.join(clips_dir, "manifest.json")
+    if not os.path.exists(path):
+        print("No manifest.json found -- using folder names as class names.")
+        return {}
+    with open(path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    mapping = {m["folder"]: m["animeENName"] for m in manifest.values()}
+    print(f"Loaded manifest with {len(manifest)} entries "
+          f"covering {len(mapping)} anime folders.")
+    return mapping
 
 
 def _find_column(df, candidates, description):
@@ -162,12 +189,21 @@ def train_from_folder_real(root_dir, connections_csv, n_neurons=2000,
                             seed=0, segment_seconds=6.0, segment_overlap=0.5,
                             batch_size=16, lr=1e-3, grad_clip=1.0):
     dataset, class_names = scan_dataset_folder(root_dir)
+
+    # Swap sanitized folder names for the original titles. Order is unchanged,
+    # so label index i still refers to the same class; only the display name
+    # differs. Folders missing from the manifest keep their folder name.
+    folder_to_original = load_folder_to_original(root_dir)
+    class_names = [folder_to_original.get(c, c) for c in class_names]
     n_classes = len(class_names)
 
     def build_temporal_split():
         train_feats, train_labels = [], []
         val_feats, val_labels = [], []
         for path, label in dataset:
+            # skip leftovers from interrupted downloads / non-audio files
+            if str(path).endswith((".part", ".tmp", ".json")):
+                continue
             try:
                 segments = audio_to_segments_with_times(
                     path, n_mels=n_mels, max_frames=max_frames,
@@ -251,9 +287,9 @@ if __name__ == "__main__":
         predict_snippet(model, class_names, hparams, snippet_path)
 
     else:
-        # usage: python3 fly_amq_classifier_real.py train training clips connections_princeton.csv
+        # usage: python3 fly_amq_classifier_real.py train "training clips" connections_princeton.csv
         if len(sys.argv) < 4 or sys.argv[1] != "train":
-            print("Usage: python3 fly_amq_classifier_real.py train <clips_folder> <connections_csv>")
+            print('Usage: python3 fly_amq_classifier_real.py train "<clips_folder>" <connections_csv>')
             sys.exit(1)
         folder = sys.argv[2]
         csv_path = sys.argv[3]

@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AMQ Tab Audio Capture</title>
+<style>
+  body { font-family: sans-serif; max-width: 500px; margin: 60px auto; text-align: center; }
+  button { font-size: 18px; padding: 12px 24px; cursor: pointer; }
+  #status { margin-top: 20px; font-family: monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+  <h2>AMQ Tab Audio Capture</h2>
+  <p>Click below, then in Chrome's picker select the <b>AMQ tab</b> and check<br><b>"Share tab audio."</b></p>
+  <button id="startBtn">Start Capture</button>
+  <button id="stopBtn" disabled>Stop</button>
+  <div id="status">Not connected.</div>
+
+<script>
+const WS_URL = "ws://localhost:8765";
+const TARGET_SAMPLE_RATE = 16000;  // must match your model's hparams['sr']
+
+let ws = null;
+let audioContext = null;
+let mediaStream = null;
+let sourceNode = null;
+let workletNode = null;
+
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+
+function log(msg) {
+  statusEl.textContent += "\n" + msg;
+  statusEl.scrollTop = statusEl.scrollHeight;
+}
+
+async function start() {
+  try {
+    ws = new WebSocket(WS_URL);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => log("Connected to Python listener at " + WS_URL);
+    ws.onclose = () => log("WebSocket closed.");
+    ws.onerror = (e) => log("WebSocket error -- is live_listener_browser.py running?");
+
+    // Prompts Chrome's native tab/window/screen picker.
+    // User must pick the AMQ TAB and check "Share tab audio".
+    mediaStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,               // required by the API even though we only want audio
+      audio: true,
+      preferCurrentTab: false,
+    });
+
+    const audioTracks = mediaStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      log("No audio track captured -- did you check 'Share tab audio' in the picker?");
+      return;
+    }
+    log("Capturing audio from: " + audioTracks[0].label);
+
+    audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+
+    // ScriptProcessorNode is deprecated but simplest/most compatible for a
+    // small local tool like this; buffer size 4096 is a reasonable tradeoff
+    // between latency and callback overhead.
+    workletNode = audioContext.createScriptProcessor(4096, 1, 1);
+    sourceNode.connect(workletNode);
+    workletNode.connect(audioContext.destination === null ? undefined : audioContext.destination);
+    // NOTE: connecting to destination would play the captured audio back out
+    // loud (echo). We don't want that, so route through a silent gain node instead:
+    workletNode.disconnect();
+    const silentGain = audioContext.createGain();
+    silentGain.gain.value = 0;
+    workletNode.connect(silentGain);
+    silentGain.connect(audioContext.destination);
+
+    workletNode.onaudioprocess = (event) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const channelData = event.inputBuffer.getChannelData(0); // Float32Array
+      // send raw float32 PCM straight over the socket
+      ws.send(channelData.buffer.slice(0));
+    };
+
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+
+    // If the user stops sharing from Chrome's own UI, clean up gracefully.
+    audioTracks[0].onended = () => stop();
+
+  } catch (err) {
+    log("Error: " + err.message);
+  }
+}
+
+function stop() {
+  if (workletNode) workletNode.disconnect();
+  if (sourceNode) sourceNode.disconnect();
+  if (audioContext) audioContext.close();
+  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  if (ws) ws.close();
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  log("Stopped.");
+}
+
+startBtn.onclick = start;
+stopBtn.onclick = stop;
+</script>
+</body>
+</html>

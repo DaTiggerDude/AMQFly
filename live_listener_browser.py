@@ -3,6 +3,10 @@ Same guessing logic as live_listener.py, but audio comes from a browser tab
 (via tab_capture.html) over a local WebSocket instead of from sounddevice /
 BlackHole. Run this, then open tab_capture.html in Chrome and click Start.
 
+Manual toggle: press Enter in this terminal the moment a new song starts and
+the listener resets and starts guessing. Type "a" then Enter to switch the
+automatic spectral-jump detection on or off while it's running.
+
 pip install websockets --break-system-packages
 """
 
@@ -35,6 +39,10 @@ COOLDOWN_SECONDS = 3.0
 
 MIN_SECONDS_BEFORE_CHECKING = 1.5
 EARLY_EXIT_CONFIDENCE = 0.85
+
+# --- manual toggle ---
+MANUAL_TRIGGER = True   # press Enter in this terminal when a new song starts
+AUTO_DETECT = False     # starting state of automatic detection; type "a" + Enter to flip it live
 
 
 def spectral_fingerprint(y, sr, n_bands=20):
@@ -70,6 +78,13 @@ class ListenerState:
         self.prev_fingerprint = None
         self.cooldown_remaining = 0.0
         self.pending_guess = False
+        self.auto_detect = AUTO_DETECT
+
+    def start_new_song(self):
+        """Reset so the next guess uses only audio heard from this moment on."""
+        self.cooldown_remaining = COOLDOWN_SECONDS
+        self.pending_guess = True
+        self.song_buffer = np.zeros(0, dtype=np.float32)
 
     def push_audio(self, mono_chunk):
         self.buffer = np.concatenate([self.buffer, mono_chunk])[-self.window_samples:]
@@ -96,10 +111,15 @@ async def guessing_loop(model, class_names, hparams, state):
         await asyncio.sleep(CHECK_INTERVAL)
         state.cooldown_remaining = max(0.0, state.cooldown_remaining - CHECK_INTERVAL)
 
-        recent_chunk = state.buffer[-fingerprint_samples:]
-        fingerprint = spectral_fingerprint(recent_chunk, sr)
+        if state.auto_detect:
+            recent_chunk = state.buffer[-fingerprint_samples:]
+            fingerprint = spectral_fingerprint(recent_chunk, sr)
+        else:
+            fingerprint = None
+            state.prev_fingerprint = None   # don't compare against a stale fingerprint after re-enabling
+            state.novelty_history.clear()
 
-        if state.prev_fingerprint is not None:
+        if state.auto_detect and state.prev_fingerprint is not None:
             novelty = float(np.linalg.norm(fingerprint - state.prev_fingerprint))
 
             if len(state.novelty_history) >= MIN_NOVELTY_HISTORY:
@@ -110,9 +130,7 @@ async def guessing_loop(model, class_names, hparams, state):
                 if novelty > threshold and state.cooldown_remaining <= 0.0:
                     print(f"[{time.strftime('%H:%M:%S')}] (spectral jump detected -- "
                           f"probably a new song; novelty={novelty:.1f} vs threshold={threshold:.1f})")
-                    state.cooldown_remaining = COOLDOWN_SECONDS
-                    state.pending_guess = True
-                    state.song_buffer = np.zeros(0, dtype=np.float32)
+                    state.start_new_song()
 
             state.novelty_history.append(novelty)
 
@@ -138,9 +156,14 @@ async def guessing_loop(model, class_names, hparams, state):
                     print(line)
 
                     if top_confidence >= CONFIDENCE_THRESHOLD:
-                        with open(OUTPUT_FILE, "w") as f:
-                            f.write(line + "\n")
-                        print(f"  -> confidence {top_confidence*100:.0f}% >= threshold, wrote to {OUTPUT_FILE}")
+                        try:
+                            # utf-8 explicitly: Windows defaults to cp1252, which can't encode
+                            # characters like the star in "Tenbatsu Angel Rabbie☆"
+                            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                                f.write(line + "\n")
+                            print(f"  -> confidence {top_confidence*100:.0f}% >= threshold, wrote to {OUTPUT_FILE}")
+                        except OSError as e:
+                            print(f"  -> couldn't write {OUTPUT_FILE}: {e}")
 
                     state.pending_guess = False
                 else:
@@ -148,11 +171,35 @@ async def guessing_loop(model, class_names, hparams, state):
                           f"still unsure ({class_names[top_idx[0].item()]} @ {top_confidence*100:.0f}%) -- waiting")
 
 
+async def manual_trigger_loop(state):
+    """Terminal controls: Enter = a new song just started; "a" + Enter = toggle auto-detect."""
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            line = await loop.run_in_executor(None, input)
+        except EOFError:
+            return
+        cmd = line.strip().lower()
+        if cmd == "":
+            print(f"[{time.strftime('%H:%M:%S')}] (manual trigger -- new song)")
+            state.start_new_song()
+        elif cmd == "a":
+            state.auto_detect = not state.auto_detect
+            print(f"[{time.strftime('%H:%M:%S')}] auto-detect {'ON' if state.auto_detect else 'OFF'}")
+        else:
+            print('Unknown command. Enter = new song, "a" + Enter = toggle auto-detect.')
+
+
 async def main():
     model, class_names, hparams = load_model(MODEL_PATH)
     sr = hparams.get("sr", 16000)
     window_samples = int(WINDOW_SECONDS * sr)
     state = ListenerState(sr, window_samples)
+
+    if MANUAL_TRIGGER:
+        asyncio.create_task(manual_trigger_loop(state))
+        print('Press Enter when a new song starts. Type "a" + Enter to toggle auto-detect '
+              f"(currently {'ON' if state.auto_detect else 'OFF'}).")
 
     async def handler(websocket):
         print("Browser tab connected -- listening for audio.")

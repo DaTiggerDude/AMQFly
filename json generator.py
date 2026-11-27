@@ -1,14 +1,19 @@
 import json
 import requests
 
-URL = "https://anisongdb.com/api/get_50_random_songs"
+URL = "https://anisongdb.com/api/get_n_random_songs"
 OUTPUT_FILE = "random50.json"
 
 
 def main():
     try:
-        response = requests.post(URL, timeout=15)
-        response.raise_for_status()  # Raises an error for 4xx/5xx status codes
+        response = requests.post(
+            URL,
+            json={"n": 100},
+            headers={"accept": "*/*"},
+            timeout=15,
+        )
+        response.raise_for_status()
 
         songs = response.json()
 
@@ -18,9 +23,7 @@ def main():
         print(f"Successfully saved {len(songs)} songs to {OUTPUT_FILE}")
 
     except requests.exceptions.RequestException as e:
-        print(f"Network or API error: {e}")
-    except json.JSONDecodeError:
-        print("Error: Response was not valid JSON.")
+        print(f"Network, API, or JSON error: {e}")
 
 
 if __name__ == "__main__":
