@@ -3,11 +3,15 @@ Same guessing logic as live_listener.py, but audio comes from a browser tab
 (via tab_capture.html) over a local WebSocket instead of from sounddevice /
 BlackHole. Run this, then open tab_capture.html in Chrome and click Start.
 
+Guesses are also BROADCAST back over the same WebSocket as text messages, so
+a userscript running on the quiz page can type them into the answer box.
+Binary messages = audio from the browser; text messages = guesses to the page.
+
 Manual toggle: press Enter in this terminal the moment a new song starts and
 the listener resets and starts guessing. Type "a" then Enter to switch the
 automatic spectral-jump detection on or off while it's running.
 
-pip install websockets --break-system-packages
+pip install websockets --break-system-packages   (websockets >= 10 for broadcast)
 """
 
 import asyncio
@@ -44,6 +48,12 @@ EARLY_EXIT_CONFIDENCE = 0.85
 MANUAL_TRIGGER = True   # press Enter in this terminal when a new song starts
 AUTO_DETECT = False     # starting state of automatic detection; type "a" + Enter to flip it live
 
+# --- send guesses to the web page ---
+SEND_TO_PAGE = True     # broadcast the top guess to connected pages over the WebSocket
+
+# every connected WebSocket (the audio-capture tab and/or the quiz page userscript)
+clients = set()
+
 
 def spectral_fingerprint(y, sr, n_bands=20):
     import librosa
@@ -79,12 +89,14 @@ class ListenerState:
         self.cooldown_remaining = 0.0
         self.pending_guess = False
         self.auto_detect = AUTO_DETECT
+        self.last_sent = None   # last guess pushed to the page, to avoid retyping the same answer
 
     def start_new_song(self):
         """Reset so the next guess uses only audio heard from this moment on."""
         self.cooldown_remaining = COOLDOWN_SECONDS
         self.pending_guess = True
         self.song_buffer = np.zeros(0, dtype=np.float32)
+        self.last_sent = None
 
     def push_audio(self, mono_chunk):
         self.buffer = np.concatenate([self.buffer, mono_chunk])[-self.window_samples:]
@@ -93,7 +105,7 @@ class ListenerState:
 
 async def audio_receiver(websocket, state):
     """Reads incoming binary Float32 PCM messages from the browser and pushes
-    them into the shared buffers."""
+    them into the shared buffers. Text messages are ignored."""
     async for message in websocket:
         if isinstance(message, (bytes, bytearray)):
             chunk = np.frombuffer(message, dtype=np.float32)
@@ -155,17 +167,24 @@ async def guessing_loop(model, class_names, hparams, state):
                     line = f"[{time.strftime('%H:%M:%S')}] ({seconds_collected:.1f}s heard) {guesses}"
                     print(line)
 
-                    if top_confidence >= CONFIDENCE_THRESHOLD:
-                        try:
-                            # utf-8 explicitly: Windows defaults to cp1252, which can't encode
-                            # characters like the star in "Tenbatsu Angel Rabbie☆"
-                            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                                f.write(line + "\n")
-                            print(f"  -> confidence {top_confidence*100:.0f}% >= threshold, wrote to {OUTPUT_FILE}")
-                        except OSError as e:
-                            print(f"  -> couldn't write {OUTPUT_FILE}: {e}")
+                    # push the top guess to any connected page, but only when it changes
+                    best = class_names[top_idx[0].item()]
+                    if SEND_TO_PAGE and clients and best != state.last_sent:
+                        websockets.broadcast(clients, best)   # sent as a text frame
+                        state.last_sent = best
+                        print(f"  -> sent to {len(clients)} connected page(s): {best}")
 
-                    state.pending_guess = False
+                    # if top_confidence >= CONFIDENCE_THRESHOLD:
+                    #     try:
+                    #         # utf-8 explicitly: Windows defaults to cp1252, which can't encode
+                    #         # characters like the star in "Tenbatsu Angel Rabbie☆"
+                    #         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                    #             f.write(line + "\n")
+                    #         print(f"  -> confidence {top_confidence*100:.0f}% >= threshold, wrote to {OUTPUT_FILE}")
+                    #     except OSError as e:
+                    #         print(f"  -> couldn't write {OUTPUT_FILE}: {e}")
+                    #
+                    # state.pending_guess = False
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] ({seconds_collected:.1f}s heard) "
                           f"still unsure ({class_names[top_idx[0].item()]} @ {top_confidence*100:.0f}%) -- waiting")
@@ -202,9 +221,13 @@ async def main():
               f"(currently {'ON' if state.auto_detect else 'OFF'}).")
 
     async def handler(websocket):
-        print("Browser tab connected -- listening for audio.")
-        await audio_receiver(websocket, state)
-        print("Browser tab disconnected.")
+        clients.add(websocket)
+        print(f"Browser connected ({len(clients)} total) -- listening for audio.")
+        try:
+            await audio_receiver(websocket, state)
+        finally:
+            clients.discard(websocket)
+            print(f"Browser disconnected ({len(clients)} remaining).")
 
     asyncio.create_task(guessing_loop(model, class_names, hparams, state))
 

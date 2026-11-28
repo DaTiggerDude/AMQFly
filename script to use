@@ -1,0 +1,23 @@
+// ==UserScript==
+// @name         Fly guess -> answer box
+// @match        https://animemusicquiz.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  function connect() {
+    const ws = new WebSocket("ws://localhost:8765");
+    ws.onmessage = (e) => {
+      if (typeof e.data !== "string") return;
+      const box = document.querySelector("#qpAnswerInput");
+      if (!box || box.disabled) return;
+      box.focus();
+      box.value = e.data;
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+      // To submit automatically, uncomment:
+      // box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, which: 13, bubbles: true }));
+    };
+    ws.onclose = () => setTimeout(connect, 2000);   // reconnect if Python restarts
+  }
+  connect();
+})();
